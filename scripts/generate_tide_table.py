@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Generate a C lookup table of high/low tide events for the tide_face.
+
+Uses the 37 NOAA harmonic constituents for Kingsborough CC (8517756).
+Run this once per year (when you replace the battery) and rebuild the firmware.
+"""
+
+import argparse
+import datetime
+import os
+import sys
+
+import numpy as np
+import utide
+from utide.utilities import Bunch
+
+# ---------------------------------------------------------------------------
+# NOAA harmonic constituents for station 8517756 Kingsborough CC, units feet.
+# phase values are the Greenwich (GMT) phases from NOAA.
+NOAA_CONSTITUENTS = [
+    ("M2",   2.333, 6.3,    28.984104),
+    ("S2",   0.427, 35.5,   30.0),
+    ("N2",   0.499, 351.5,  28.43973),
+    ("K1",   0.331, 174.4,  15.041069),
+    ("M4",   0.039, 317.4,  57.96821),
+    ("O1",   0.157, 167.6,  13.943035),
+    ("M6",   0.049, 62.5,   86.95232),
+    ("MK3",  0.02,  95.7,   44.025173),
+    ("S4",   0.02,  38.1,   60.0),
+    ("MN4",  0.02,  324.9,  57.423832),
+    ("NU2",  0.098, 345.3,  28.512583),
+    ("S6",   0.0,   0.0,    90.0),
+    ("MU2",  0.072, 30.1,   27.968208),
+    ("2N2",  0.059, 344.0,  27.895355),
+    ("OO1",  0.023, 163.9,  16.139101),
+    ("LAM2", 0.03,  345.7,  29.455626),
+    ("S1",   0.066, 158.6,  15.0),
+    ("M1",   0.016, 232.4,  14.496694),
+    ("J1",   0.01,  182.4,  15.5854435),
+    ("MM",   0.0,   0.0,    0.5443747),
+    ("SSA",  0.092, 42.9,   0.0821373),
+    ("SA",   0.22,  129.1,  0.0410686),
+    ("MSF",  0.0,   0.0,    1.0158958),
+    ("MF",   0.0,   0.0,    1.0980331),
+    ("RHO",  0.013, 188.9,  13.471515),
+    ("Q1",   0.052, 186.7,  13.398661),
+    ("T2",   0.046, 34.5,   29.958933),
+    ("R2",   0.02,  21.7,   30.041067),
+    ("2Q1",  0.016, 228.6,  12.854286),
+    ("P1",   0.089, 170.4,  14.958931),
+    ("2SM2", 0.007, 171.0,  31.015896),
+    ("M3",   0.033, 82.5,   43.47616),
+    ("L2",   0.089, 349.5,  29.528479),
+    ("2MK3", 0.01,  40.8,   42.92714),
+    ("K2",   0.144, 36.2,   30.082138),
+    ("M8",   0.007, 146.2,  115.93642),
+    ("MS4",  0.016, 204.2,  58.984104),
+]
+
+# UTide uses slightly different names for a few constituents.
+UTIDE_NAME_MAP = {
+    "RHO": "RHO1",
+}
+
+
+def build_utide_coef(lat=40.5812):
+    uc = utide.ut_constants
+    names = np.array([n.strip().upper() for n in uc.const["name"]])
+
+    constits = []
+    for name, amp, phase, speed in NOAA_CONSTITUENTS:
+        if amp <= 0:
+            continue
+        utide_name = UTIDE_NAME_MAP.get(name, name)
+        idx = np.where(names == utide_name)[0]
+        if len(idx) == 0:
+            print(f"warning: constituent {name} not in UTide, skipping", file=sys.stderr)
+            continue
+        constits.append((utide_name, amp, phase, speed, idx[0]))
+
+    A = np.array([c[1] for c in constits])
+    g = np.array([c[2] for c in constits])
+    lind = np.array([c[4] for c in constits])
+
+    coef = Bunch()
+    coef["name"] = np.array([c[0] for c in constits])
+    coef["A"] = A
+    coef["g"] = g
+    coef["A_ci"] = np.zeros_like(A)
+    coef["mean"] = 0.0
+    coef["slope"] = 0.0
+
+    aux = Bunch()
+    aux["reftime"] = 0.0
+    aux["frq"] = uc.const["freq"][lind]
+    aux["lind"] = lind
+    aux["lat"] = lat
+    aux["opt"] = Bunch(
+        nodiagn=True,
+        nodsatlint=False,
+        nodsatnone=False,
+        gwchlint=False,
+        gwchnone=False,
+        prefilt=None,
+        notrend=True,
+        twodim=False,
+    )
+    coef["aux"] = aux
+    return coef
+
+
+def find_extrema(times, heights):
+    events = []
+    for i in range(1, len(heights) - 1):
+        if heights[i] > heights[i - 1] and heights[i] > heights[i + 1]:
+            events.append((times[i], heights[i], "H"))
+        elif heights[i] < heights[i - 1] and heights[i] < heights[i + 1]:
+            events.append((times[i], heights[i], "L"))
+    return events
+
+
+def generate_events(start, days=365, lat=40.5812):
+    coef = build_utide_coef(lat)
+    n_min = int(days * 24 * 60) + 1
+
+    # Reconstruct in daily chunks to keep memory use modest.
+    chunk = 24 * 60
+    times = []
+    hs = []
+    for i in range(0, n_min, chunk):
+        tl = [start + datetime.timedelta(minutes=int(m)) for m in range(i, min(i + chunk, n_min))]
+        res = utide.reconstruct(tl, coef, verbose=False)
+        times.extend(tl)
+        hs.append(res.h)
+    hs = np.concatenate(hs)
+    return times, hs
+
+
+def write_header(events, start_unix, out_path):
+    times = []
+    heights = []
+    for t, h, kind in events:
+        # Round to nearest minute and store height in tenths of a foot.
+        # Positive height means high tide, negative means low tide.
+        h10 = int(round(h * 10))
+        if kind == "L":
+            h10 = -abs(h10)
+        else:
+            h10 = abs(h10)
+        times.append(t)
+        heights.append(h10)
+
+    basename = os.path.basename(out_path)
+    guard = "TIDE_TABLE_GENERATED_H_"
+    lines = []
+    lines.append(f"/* Auto-generated by scripts/generate_tide_table.py */")
+    lines.append(f"#ifndef {guard}")
+    lines.append(f"#define {guard}")
+    lines.append("")
+    lines.append("#include <stdint.h>")
+    lines.append("")
+    start_dt = datetime.datetime.utcfromtimestamp(start_unix)
+    lines.append(f"/* Kingsborough CC (8517756) tide events from {start_dt.isoformat()}Z */")
+    lines.append(f"#define TIDE_TABLE_START_UNIX {int(start_unix)}U")
+    lines.append(f"#define TIDE_TABLE_NUM_EVENTS {len(times)}U")
+    lines.append("")
+    lines.append("/* Times are UTC Unix timestamps. Heights are in tenths of a foot relative to MSL. */")
+    lines.append("/* Positive height = high tide, negative height = low tide. */")
+    lines.append("static const uint32_t tide_event_times[TIDE_TABLE_NUM_EVENTS] = {")
+    lines.append(", ".join(str(int(t.timestamp())) + "U" for t in times))
+    lines.append("};")
+    lines.append("")
+    lines.append("static const int16_t tide_event_heights[TIDE_TABLE_NUM_EVENTS] = {")
+    lines.append(", ".join(str(h) for h in heights))
+    lines.append("};")
+    lines.append("")
+    lines.append(f"#endif /* {guard} */")
+    lines.append("")
+
+    with open(out_path, "w") as f:
+        f.write("\n".join(lines))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate tide table header for Kingsborough CC.")
+    parser.add_argument(
+        "--start",
+        type=lambda s: datetime.datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc),
+        default=datetime.datetime.now(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0),
+        help="Start date in YYYY-MM-DD (UTC). Defaults to today.",
+    )
+    parser.add_argument("--days", type=int, default=365, help="Number of days to generate (default 365).")
+    parser.add_argument("--lat", type=float, default=40.5812, help="Station latitude.")
+    parser.add_argument("-o", "--output", default="watch-faces/complication/tide_table_generated.h", help="Output header path.")
+    args = parser.parse_args()
+
+    start_unix = int(args.start.timestamp())
+    print(f"Generating tide table from {args.start.isoformat()} for {args.days} days...")
+    times, hs = generate_events(args.start, args.days, args.lat)
+    events = find_extrema(times, hs)
+    print(f"Found {len(events)} high/low events.")
+
+    out_path = args.output
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    write_header(events, start_unix, out_path)
+    print(f"Wrote {out_path} ({os.path.getsize(out_path)} bytes).")
+
+
+if __name__ == "__main__":
+    main()

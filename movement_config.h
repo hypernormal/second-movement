@@ -29,30 +29,29 @@
 
 const watch_face_t watch_faces[] = {
     clock_face,
-    world_clock_face,
-    sunrise_sunset_face,
-    moon_phase_face,
-    fast_stopwatch_face,
-    countdown_face,
     alarm_face,
-    temperature_display_face,
-    voltage_face,
+    sunrise_sunset_face,
+    tide_face,
+    moon_phase_face,
+    bpm_face,
+    stopwatch_face,
+    countdown_face,
+    // Secondary faces (accessed by long-pressing Mode)
     settings_face,
     set_time_face,
+    temperature_display_face,
+    voltage_face,
 };
 
 #define MOVEMENT_NUM_FACES (sizeof(watch_faces) / sizeof(watch_face_t))
 
-/* Determines what face to go to from the first face on long press of the Mode button.
- * Also excludes these faces from the normal rotation.
- * In the default firmware, this lets you access temperature and battery voltage with a long press of Mode.
- * Some folks also like to use this to hide the preferences and time set faces from the normal rotation.
- * If you don't want any faces to be excluded, set this to 0 and a long Mode press will have no effect.
+/* Long-press Mode jumps to index 8 and excludes these faces from the normal rotation.
+ * That keeps settings, set-time, temperature and voltage out of the primary face loop.
  */
-#define MOVEMENT_SECONDARY_FACE_INDEX (MOVEMENT_NUM_FACES - 5)
+#define MOVEMENT_SECONDARY_FACE_INDEX 8
 
 /* Custom hourly chime tune. Check movement_custom_signal_tunes.h for options. */
-#define SIGNAL_TUNE_DEFAULT
+#define SIGNAL_TUNE_ZELDA_SECRET
 
 /* Determines the intensity of the led colors
  * Set a hex value 0-15 with 0x0 being off and 0xF being max intensity

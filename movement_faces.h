@@ -42,6 +42,7 @@
 #include "temperature_logging_face.h"
 #include "activity_logging_face.h"
 #include "voltage_face.h"
+#include "bpm_face.h"
 #include "set_time_face.h"
 #include "settings_face.h"
 #include "light_sensor_face.h"
