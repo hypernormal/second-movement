@@ -53,14 +53,67 @@ static uint32_t _bpm_face_frequency(void) {
 #endif
 }
 
-static void _bpm_face_record_tap(bpm_state_t *state) {
-    // Store a monotonic high-resolution timestamp for each tap so we can
-    // compute sub-second intervals between consecutive taps.
-    if (state->count < BPM_BUFFER_SIZE) {
-        state->count++;
+static uint16_t _bpm_face_calculate(bpm_state_t *state, uint32_t now);
+
+static bool _bpm_face_record_tap(bpm_state_t *state) {
+    uint32_t now = _bpm_face_now();
+    uint32_t frequency = _bpm_face_frequency();
+
+    // Convert the configured minimum tap interval from milliseconds to RTC
+    // ticks (or emulated milliseconds). This blocks the false double triggers
+    // that make the BPM readout jump around.
+    uint32_t min_interval_ticks = ((uint64_t)BPM_MIN_TAP_INTERVAL_MS * frequency) / 1000;
+
+    bool accepted = true;
+    uint32_t interval_ticks = 0;
+    if (state->count > 0) {
+        uint8_t newest_index = (state->head + BPM_BUFFER_SIZE - 1) % BPM_BUFFER_SIZE;
+        interval_ticks = now - state->tap_times[newest_index];
+        if (interval_ticks < min_interval_ticks) {
+            accepted = false;
+        }
     }
-    state->tap_times[state->head] = _bpm_face_now();
-    state->head = (state->head + 1) % BPM_BUFFER_SIZE;
+
+    if (accepted) {
+        if (state->count < BPM_BUFFER_SIZE) {
+            state->count++;
+        }
+        state->tap_times[state->head] = now;
+        state->head = (state->head + 1) % BPM_BUFFER_SIZE;
+        state->last_accepted_tap = now;
+    }
+
+#if BPM_DEBUG_SERIAL
+    uint64_t interval_ms = (uint64_t)interval_ticks * 1000 / (frequency ? frequency : 1);
+    uint16_t current_bpm = _bpm_face_calculate(state, now);
+    printf("bpm tap: %s interval_ms=%lu count=%u bpm=%u\r\n",
+           accepted ? "ACCEPTED" : "REJECTED",
+           (unsigned long)interval_ms,
+           (unsigned)state->count,
+           (unsigned)current_bpm);
+#endif
+
+    return accepted;
+}
+
+// Sorts a small array of interval ticks in place and returns the median.
+static uint32_t _bpm_face_interval_median(uint32_t *intervals, uint8_t n) {
+    if (n == 0) return 0;
+
+    for (uint8_t i = 1; i < n; i++) {
+        uint32_t key = intervals[i];
+        int8_t j = (int8_t)i - 1;
+        while (j >= 0 && intervals[j] > key) {
+            intervals[j + 1] = intervals[j];
+            j--;
+        }
+        intervals[j + 1] = key;
+    }
+
+    if (n % 2) {
+        return intervals[n / 2];
+    }
+    return (intervals[n / 2 - 1] + intervals[n / 2]) / 2;
 }
 
 static uint16_t _bpm_face_calculate(bpm_state_t *state, uint32_t now) {
@@ -90,8 +143,43 @@ static uint16_t _bpm_face_calculate(bpm_state_t *state, uint32_t now) {
         return 0;
     }
 
-    // Average all intervals between consecutive stored taps and convert to BPM.
-    float average_interval_s = (float)elapsed_ticks / ((state->count - 1) * frequency);
+    uint8_t n_intervals = state->count - 1;
+    uint32_t intervals[BPM_BUFFER_SIZE];
+
+    // Compute every consecutive interval in the stored window.
+    uint8_t idx = oldest_index;
+    for (uint8_t i = 0; i < n_intervals; i++) {
+        uint8_t next_idx = (idx + 1) % BPM_BUFFER_SIZE;
+        intervals[i] = state->tap_times[next_idx] - state->tap_times[idx];
+        idx = next_idx;
+    }
+
+    // Use the median interval as a robust reference, then drop any intervals
+    // that deviate too far from it before averaging. This is far less twitchy
+    // than the simple mean when the accelerometer fires an extra tap event.
+    uint32_t median_interval = _bpm_face_interval_median(intervals, n_intervals);
+    if (median_interval == 0) {
+        return 0;
+    }
+
+    uint32_t lower = (median_interval * BPM_OUTLIER_LOW_NUMERATOR) / BPM_OUTLIER_LOW_DENOMINATOR;
+    uint32_t upper = (median_interval * BPM_OUTLIER_HIGH_NUMERATOR) / BPM_OUTLIER_HIGH_DENOMINATOR;
+
+    uint64_t inlier_sum = 0;
+    uint8_t inlier_count = 0;
+    for (uint8_t i = 0; i < n_intervals; i++) {
+        uint32_t interval = intervals[i];
+        if (interval >= lower && interval <= upper) {
+            inlier_sum += interval;
+            inlier_count++;
+        }
+    }
+
+    // If every interval was rejected, fall back to the median so we still
+    // display a sensible value.
+    uint32_t average_interval_ticks = (inlier_count > 0) ? (uint32_t)(inlier_sum / inlier_count) : median_interval;
+
+    float average_interval_s = (float)average_interval_ticks / frequency;
     uint16_t bpm = (uint16_t)((60.0f / average_interval_s) + 0.5f);
     return bpm;
 }
@@ -127,7 +215,12 @@ void bpm_face_activate(void *context) {
     // Start with a clean window each time the face is opened.
     state->head = 0;
     state->count = 0;
+    state->last_accepted_tap = 0;
     state->tap_available = movement_enable_tap_detection_if_available(false);
+
+#if BPM_DEBUG_SERIAL
+    printf("bpm: face active, tap detection available=%d\r\n", state->tap_available);
+#endif
 
     movement_request_tick_frequency(1);
     _bpm_face_update_display(state);
@@ -161,6 +254,7 @@ bool bpm_face_loop(movement_event_t event, void *context) {
             // Clear the moving window.
             state->head = 0;
             state->count = 0;
+            state->last_accepted_tap = 0;
             _bpm_face_update_display(state);
             break;
         default:

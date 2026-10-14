@@ -16,6 +16,23 @@ if [ ! -f "$UF2_FILE" ]; then
 fi
 echo "[debug] UF2 file: $UF2_FILE ($(stat -c%s "$UF2_FILE") bytes)"
 
+# fwupd will aggressively probe the UF2 bootloader and can reset the watch before
+# the copy finishes, so stop it for the duration of the upload.
+FWUPD_WAS_RUNNING=0
+cleanup_fwupd() {
+    if [ "$FWUPD_WAS_RUNNING" -eq 1 ]; then
+        echo "[debug] restarting fwupd.service"
+        sudo systemctl start fwupd.service >/dev/null 2>&1 || true
+    fi
+}
+if systemctl is-active --quiet fwupd.service 2>/dev/null && \
+   systemctl cat fwupd.service >/dev/null 2>&1; then
+    echo "[debug] stopping fwupd.service"
+    sudo systemctl stop fwupd.service
+    FWUPD_WAS_RUNNING=1
+    trap cleanup_fwupd EXIT
+fi
+
 echo "[debug] looking for auto-mounted UF2 drive..."
 
 # Try to find an auto-mounted UF2 drive first.
